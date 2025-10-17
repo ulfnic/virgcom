@@ -1,0 +1,207 @@
+#!/usr/bin/env bash
+[[ $DEBUG ]] && set -x
+set -o errexit
+
+
+help_doc() {
+	{ read -r -d '' || :; [[ $REPLY == '|'* ]] && REPLY=${REPLY:1}; printf '%s' "${REPLY//$'\n|'/$'\n'}"; } <<-'HelpDoc'
+		|virgcom [ARGUEMENT...]
+		|
+		|	Proof of concept
+		|
+		|	An "sshless" virsh wrapper that executes a command inside a guest,
+		|	then repeats the stdout, stderr and exit code on the host.
+
+		|DEPENDENCIES
+		|	virsh jq base64
+
+		|ARGUEMENT
+		|	-d|--domain DOMAIN          Domain of VM
+		|	-c|--command COMMAND        String to execute using: bash -c
+		|	-S|--send-only              Only send the command
+		|	-r|--retry-max COUNT        Wait for process to finish COUNT times, default: 100
+		|	-s|--retry-speed SECONDS    Time between retries, default: 0.1
+		|	-k|--kill-after-max-retry   kill -9 process inside VM if max retries is exceeded
+		|	-v|--verbose                Verbose output
+		|	-h|--help                   Print help doc
+
+		|ENVIRONMENT
+		|	DEBUG                       Use set -x to print debugging information
+
+		|EXAMPLES
+		|	virgcom -d my_vm -c 'free -h'
+	HelpDoc
+	[[ $1 ]] && exit "$1"
+}
+
+
+
+print_stderr() {
+	if [[ $1 == '0' ]]; then
+		[[ $2 ]] && printf "$2" "${@:3}" 1>&2 || :
+	else
+		[[ $2 ]] && printf '%s'"$2" "ERROR: ${0##*/}, " "${@:3}" 1>&2 || :
+		exit "$1"
+	fi
+}
+
+
+
+[[ $1 ]] || help_doc 0
+domain=
+cmd=
+send_only=
+retry_max=100
+retry_speed_sec=0.1
+kill_after_max_retry=
+verbose=
+while [[ $1 ]]; do
+	case $1 in
+		'--domain'|'-d')
+			shift; domain=$1 ;;
+		'--command'|'-c')
+			shift; cmd=$1 ;;
+		'--send-only'|'-s')
+			send_only=1 ;;
+		'--retry-max'|'-r')
+			shift; retry_max=$1 ;;
+		'--retry-speed'|'-s')
+			shift; retry_speed_sec=$1 ;;
+		'--kill-after-max-retry'|'-k')
+			kill_after_max_retry=1 ;;
+		'--verbose'|'-v')
+			verbose=1 ;;
+		'--help'|'-h')
+			help_doc 0 ;;
+		*)
+			print_stderr 1 '%s %q\n' 'unrecognized parameter:' "$1" ;;
+	esac
+	shift
+done
+
+
+
+type virsh jq base64 1>/dev/null
+[[ $domain ]] || print_stderr 1 '%s\n' 'no domain provided'
+[[ $cmd ]] || print_stderr 1 '%s\n' 'no command provided'
+[[ $retry_max != *[^0123456789]* ]] || print_stderr 1 '%s %q\n' 'retry max is not a whole number:' "$retry_max"
+[[ $retry_speed_sec != *[^0123456789.]* ]] || print_stderr 1 '%s %q\n' 'retry speed is NaN:' "$retry_speed_sec"
+
+
+
+json_encode() {
+	local -n 'json_encode__str='"$1"
+	json_encode__str=${json_encode__str//\\/\\\\}
+	json_encode__str=${json_encode__str//\"/\\\"} #"
+	json_encode__str=${json_encode__str//$'\n'/\\n}
+	json_encode__str=${json_encode__str//$'\t'/\\t}
+}
+
+
+
+send() {
+	send__pid=
+	local domain=$1 cmd=$2
+	local REPLY req_json res_json
+
+
+	# Send request
+	json_encode cmd
+	{ read -r -d '' || REPLY=${REPLY//,$'\n'/', '}; req_json=${REPLY//$'\n'}; } <<-EOF
+		{
+			"execute": "guest-exec",
+			"arguments": {
+				"path": "/bin/bash",
+				"arg": ["-c","${cmd}"],
+				"capture-output": true
+			}
+		}
+	EOF
+	[[ $verbose ]] && print_stderr 0 '%s\n' "send() req_json=$req_json"
+	res_json=$( sudo virsh qemu-agent-command "$domain" "$req_json")
+	[[ $verbose ]] && print_stderr 0 '%s\n' "send() res_json=$res_json"
+
+
+	# Process response
+	send__pid=$(printf '%s\n' "$res_json" | jq -r '.return.pid')
+	[[ $send__pid ]] || print_stderr 1 '%s\n' 'no pid from command'
+	[[ $send__pid != *[^0123456789]* ]] || print_stderr 1 '%s %q\n' 'not a pid:' "$send__pid"
+	return 0
+}
+
+
+
+recv__timed_out=
+recv() {
+	local \
+		pid=$1 \
+		retry_count=$retry_max \
+		REPLY req_json res_json exited stdout_base64 stderr_base64 exit_code
+
+
+	# Prepare request
+	{ read -r -d '' || REPLY=${REPLY//,$'\n'/', '}; req_json=${REPLY//$'\n'}; } <<-EOF
+		{
+			"execute": "guest-exec-status",
+			"arguments": {
+				"pid":${pid}
+			}
+		}
+	EOF
+	[[ $verbose ]] && print_stderr 0 '%s\n' "recv() req_json=$req_json"
+
+
+	send_req(){
+		exited=
+
+		res_json=$( sudo virsh qemu-agent-command "$domain" "$req_json" )
+		[[ $verbose ]] && print_stderr 0 '%s\n' "recv() res_json=$res_json"
+
+		# Process exit code
+		exited=$(printf '%s\n' "$res_json" | jq -r '.return.exited')
+	}
+
+
+	# Request till timeout
+	send_req
+	while [[ $exited  == 'false' ]]; do
+		if (( retry_count-- <= 0 )); then
+			# timeout
+			[[ $recv__timed_out ]] && print_stderr 1 '%s\n' 'Timed out waiting for kill command'
+			recv__timed_out=1
+
+			print_stderr 0 '%s\n' 'Timed out waiting for process to exited'
+			[[ $kill_after_max_retry ]] || exit 1
+
+			print_stderr 0 '%s\n' "Attempting to kill pid ${pid} inside ${domain}"
+			send "$domain" "kill -9 -- $pid"
+			recv "$send__pid"
+		fi
+		sleep -- "$retry_speed_sec"
+		send_req
+	done
+
+
+	# Process response
+	stdout_base64=$(jq --exit-status -r '.return."out-data"' < <(printf '%s' "$res_json")) || stdout_base64=
+	stderr_base64=$(jq --exit-status -r '.return."err-data"' < <(printf '%s' "$res_json")) || stderr_base64=
+	exit_code=$(printf '%s\n' "$res_json" | jq -r '.return.exitcode')
+	[[ ! $exit_code || $exit_code == *[^0123456789]* ]] && print_stderr 1 '%s %q\n' 'bad exit code:' "$exit_code"
+
+
+	[[ $stdout_base64 ]] && base64 -d < <(printf '%s' "$stdout_base64")
+	[[ $stderr_base64 ]] && base64 -d 1>&2 < <(printf '%s' "$stderr_base64")
+
+
+	[[ $recv__timed_out ]] && print_stderr 1 '%s\n' 'Process killed successfully'
+	return "$exit_code"
+}
+
+
+
+send "$domain" "$cmd"
+[[ $send_only ]] && exit 0
+recv "$send__pid"
+
+
+
