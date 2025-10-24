@@ -19,7 +19,7 @@ virgcom [ARGUEMENT...]
 	then repeats the stdout, stderr and exit code on the host.
 
 DEPENDENCIES
-	virsh jq base64
+	virsh, jq, base64
 
 ARGUEMENT
 	-d|--domain DOMAIN          Domain of VM
